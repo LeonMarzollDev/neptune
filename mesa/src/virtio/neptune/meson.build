@@ -10,6 +10,7 @@ npt_common_src = files(
   'npt_env.c',
   'npt_event.c',
   'npt_profile.c',
+  'npt_privdata.c',
   'npt_ring.c',
   'npt_tls.c',
   'npt_shmem_pool.c',

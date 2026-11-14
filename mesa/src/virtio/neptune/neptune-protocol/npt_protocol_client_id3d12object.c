@@ -11,6 +11,7 @@
 
 #include "npt_protocol_client_id3d12object.h"
 #include "npt_com.h"
+#include "../npt_privdata.h"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -58,6 +59,11 @@ npt_id3d12object_default_Release(void *self)
 HRESULT NPT_STDMETHODCALLTYPE
 npt_id3d12object_default_GetPrivateData(void *self, const GUID * guid, UINT * pDataSize, void * pData)
 {
+    /* Hand edit (not generated): answer from the guest's record when it is
+     * certain, see npt_privdata.h. */
+    HRESULT _local;
+    if (npt_privdata_get(npt_com_self_id(self), guid, pDataSize, pData, &_local))
+        return _local;
     HRESULT _ret = npt_call_ID3D12Object_GetPrivateData(npt_com_self_ring(self),npt_com_self_id(self),guid,pDataSize,pData);
     return _ret;
 }
@@ -65,6 +71,7 @@ npt_id3d12object_default_GetPrivateData(void *self, const GUID * guid, UINT * pD
 HRESULT NPT_STDMETHODCALLTYPE
 npt_id3d12object_default_SetPrivateData(void *self, const GUID * guid, UINT DataSize, const void * pData)
 {
+    npt_privdata_set(npt_com_self_id(self), guid, DataSize, pData);
     npt_async_ID3D12Object_SetPrivateData(npt_com_self_ring(self),npt_com_self_id(self),guid,DataSize,pData);
     /* Async under the deferred-fatal model: assume success.  Host-side
      * failures (OOM, bad arg) leave the guest_id unregistered, so the
@@ -76,6 +83,7 @@ npt_id3d12object_default_SetPrivateData(void *self, const GUID * guid, UINT Data
 HRESULT NPT_STDMETHODCALLTYPE
 npt_id3d12object_default_SetPrivateDataInterface(void *self, const GUID * guid, const IUnknown * pData)
 {
+    npt_privdata_set_opaque(npt_com_self_id(self), guid);
     npt_async_ID3D12Object_SetPrivateDataInterface(npt_com_self_ring(self),npt_com_self_id(self),guid,pData);
     /* Async under the deferred-fatal model: assume success.  Host-side
      * failures (OOM, bad arg) leave the guest_id unregistered, so the
@@ -87,6 +95,7 @@ npt_id3d12object_default_SetPrivateDataInterface(void *self, const GUID * guid, 
 HRESULT NPT_STDMETHODCALLTYPE
 npt_id3d12object_default_SetName(void *self, const WCHAR * Name)
 {
+    npt_privdata_note_name(npt_com_self_id(self));
     npt_async_ID3D12Object_SetName(npt_com_self_ring(self),npt_com_self_id(self),Name);
     /* Async under the deferred-fatal model: assume success.  Host-side
      * failures (OOM, bad arg) leave the guest_id unregistered, so the
