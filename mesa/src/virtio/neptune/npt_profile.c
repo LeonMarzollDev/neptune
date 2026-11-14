@@ -481,6 +481,18 @@ npt_profile_dump(const char *reason)
               (unsigned long long)ptrs[i]->reply_ns,
               (unsigned long long)ptrs[i]->bytes);
    }
+
+   /* Every method that waited for a reply, whatever its call count: the
+    * count-sorted list above hides rare but slow synchronous calls. */
+   for (uint32_t i = 0; i < n; i++) {
+      if (!ptrs[i]->reply_ns)
+         continue;
+      char label[32];
+      npt_profile_format_cmd(label, sizeof(label), ptrs[i]->cmd_type);
+      npt_log("NPT-PROF-GUEST-SYNC cmd=0x%08x %s count=%u reply_ns=%llu",
+              (unsigned)ptrs[i]->cmd_type, label, (unsigned)ptrs[i]->count,
+              (unsigned long long)ptrs[i]->reply_ns);
+   }
 }
 
 void
