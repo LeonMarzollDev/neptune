@@ -97,9 +97,52 @@ queue12_Signal_override(void *self, ID3D12Fence *pFence, UINT64 Value)
    return npt_id3d12commandqueue_default_Signal(self, pFence, Value);
 }
 
+/* The timestamp frequency of a queue never changes, and engines read it
+ * every frame for their GPU timers: one round trip per queue is enough. */
+#define QUEUE12_FREQ_SLOTS 16u
+struct queue12_freq_entry {
+   _Atomic uint64_t object_id;
+   _Atomic uint64_t frequency;
+};
+static struct queue12_freq_entry queue12_freq_cache[QUEUE12_FREQ_SLOTS];
+
+static HRESULT NPT_STDMETHODCALLTYPE
+queue12_GetTimestampFrequency_override(void *self, UINT64 *pFrequency)
+{
+   if (!pFrequency)
+      return npt_id3d12commandqueue_default_GetTimestampFrequency(self, pFrequency);
+
+   const uint64_t id = npt_com_self_id(self);
+   for (unsigned i = 0; i < QUEUE12_FREQ_SLOTS; i++) {
+      if (atomic_load(&queue12_freq_cache[i].object_id) == id) {
+         const uint64_t f = atomic_load(&queue12_freq_cache[i].frequency);
+         if (f) {
+            *pFrequency = f;
+            return NPT_S_OK;
+         }
+      }
+   }
+
+   const HRESULT hr =
+      npt_id3d12commandqueue_default_GetTimestampFrequency(self, pFrequency);
+   if (NPT_SUCCEEDED(hr) && *pFrequency) {
+      for (unsigned i = 0; i < QUEUE12_FREQ_SLOTS; i++) {
+         uint64_t empty = 0;
+         if (atomic_compare_exchange_strong(&queue12_freq_cache[i].object_id,
+                                            &empty, id)) {
+            atomic_store(&queue12_freq_cache[i].frequency, *pFrequency);
+            break;
+         }
+      }
+   }
+   return hr;
+}
+
 void
 npt_overrides_d3d12_queue_init(void)
 {
+   NPT_REGISTER_OVERRIDE(id3d12commandqueue, GetTimestampFrequency,
+                         queue12_GetTimestampFrequency_override);
    NPT_REGISTER_OVERRIDE(id3d12commandqueue, ExecuteCommandLists,
                          queue12_ExecuteCommandLists_override);
    NPT_REGISTER_OVERRIDE(id3d12commandqueue, Signal,
