@@ -18,6 +18,8 @@
 #include "npt_profile.h"
 
 #include <unistd.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "neptune-protocol/npt_protocol_host_dispatch_types.h"
 #include "neptune-protocol/npt_protocol_host_id3d12commandqueue.h"
@@ -58,6 +60,21 @@ npt_d3d12_gate_reached(void *fence, uint64_t value)
    return get(fence) >= value;
 }
 
+/* A queue Wait that reaches the host before its Signal sleeps on this condition; every dispatched Signal wakes the
+ * waiters.  The Wait used to poll with usleep(200): Unreal Engine 5 synchronizes its graphics, compute and copy
+ * queues about 65 times a frame, and each poll kept that queue's ring thread asleep for 200 us or more after the
+ * Signal had already arrived. */
+static pthread_mutex_t npt_d3d12_signal_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t npt_d3d12_signal_cond = PTHREAD_COND_INITIALIZER;
+
+static void
+npt_d3d12_signal_wake(void)
+{
+   pthread_mutex_lock(&npt_d3d12_signal_mutex);
+   pthread_cond_broadcast(&npt_d3d12_signal_cond);
+   pthread_mutex_unlock(&npt_d3d12_signal_mutex);
+}
+
 static HRESULT
 npt_override_ID3D12CommandQueue_Signal(
    struct npt_dispatch_context *dctx,
@@ -69,6 +86,7 @@ npt_override_ID3D12CommandQueue_Signal(
    if (NPT_SUCCEEDED(args->ret) && args->pFence) {
       npt_feedback_fence_mark_signal(npt_context_from_dispatch(dctx),
                                      args->pFence, args->Value);
+      npt_d3d12_signal_wake();
    }
    return args->ret;
 }
@@ -84,6 +102,7 @@ npt_override_ID3D12Fence_Signal(
    if (NPT_SUCCEEDED(args->ret)) {
       npt_feedback_fence_mark_signal(npt_context_from_dispatch(dctx),
                                      args->_self, args->Value);
+      npt_d3d12_signal_wake();
    }
    return args->ret;
 }
@@ -96,6 +115,7 @@ npt_override_ID3D12Fence_Signal(
  * not come within NPT_QUEUE_WAIT_UNSIGNALLED_NS may be queued behind this very Wait, and the backend gets the Wait
  * then. */
 #define NPT_QUEUE_WAIT_UNSIGNALLED_NS 100000000ll
+#define NPT_QUEUE_WAIT_SLICE_NS 200000l
 
 /* Whether a Signal of at least value has reached the host for this fence: the latest one, not the highest, which after
  * a rewind (Signal of a lower value) says nothing about the value being waited for.  A Signal still behind an older
@@ -123,10 +143,16 @@ npt_override_ID3D12CommandQueue_Wait(
    if (args->pFence && !npt_d3d12_gate_reached(args->pFence, args->Value)) {
       struct npt_context *ctx = npt_context_from_dispatch(dctx);
       const int64_t t0 = npt_profile_now_ns();
+      /* The fence can also reach the value with no Signal dispatched here (a Signal of another context, or a
+       * completion on the GPU), which wakes nobody: the wait is cut into slices so those are still seen. */
+      pthread_mutex_lock(&npt_d3d12_signal_mutex);
       while (!npt_d3d12_fence_signal_dispatched(ctx, args->pFence, args->Value) &&
              !npt_d3d12_gate_reached(args->pFence, args->Value) &&
-             npt_profile_now_ns() - t0 < NPT_QUEUE_WAIT_UNSIGNALLED_NS)
-         usleep(200);
+             npt_profile_now_ns() - t0 < NPT_QUEUE_WAIT_UNSIGNALLED_NS) {
+         struct timespec slice = { 0, NPT_QUEUE_WAIT_SLICE_NS };
+         pthread_cond_timedwait_relative_np(&npt_d3d12_signal_cond, &npt_d3d12_signal_mutex, &slice);
+      }
+      pthread_mutex_unlock(&npt_d3d12_signal_mutex);
    }
    args->ret = original(args->_self, args->pFence, args->Value);
    return args->ret;
