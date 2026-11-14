@@ -26,6 +26,8 @@
 #include "nptunix/npt_unixlib.h"
 #endif
 
+#include "util/os_time.h"
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -201,6 +203,57 @@ adp3_UnregisterVideoMemoryBudgetChangeNotification_override(void *self,
    (void)self; (void)dwCookie;
 }
 
+/* QueryVideoMemoryInfo is a synchronous round trip to the render server, and
+ * Unreal Engine 5 polls it thousands of times a second from its RHI threads
+ * (about 2,400 calls a second in Bodycam's lobby, 170 us each: 40% of one
+ * thread waiting).  The budget and usage it reports move slowly, so one answer
+ * per segment group is kept for NPT_VIDMEM_CACHE_NS and served from the guest.
+ * Node 0 only: a multi-adapter caller still asks the host. */
+#define NPT_VIDMEM_CACHE_NS (100ll * 1000 * 1000)
+
+struct adp3_vidmem_cache {
+   SRWLOCK lock;
+   bool valid[2];
+   int64_t stamp_ns[2];
+   HRESULT hr[2];
+   DXGI_QUERY_VIDEO_MEMORY_INFO info[2];
+};
+
+static struct adp3_vidmem_cache adp3_vidmem = { .lock = SRWLOCK_INIT };
+
+static HRESULT NPT_STDMETHODCALLTYPE
+adp3_QueryVideoMemoryInfo_override(
+   void *self, UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
+   DXGI_QUERY_VIDEO_MEMORY_INFO *pVideoMemoryInfo)
+{
+   const unsigned group = (unsigned)MemorySegmentGroup;
+   if (NodeIndex != 0 || group > 1 || !pVideoMemoryInfo)
+      return npt_idxgiadapter3_default_QueryVideoMemoryInfo(
+         self, NodeIndex, MemorySegmentGroup, pVideoMemoryInfo);
+
+   const int64_t now = os_time_get_nano();
+   AcquireSRWLockExclusive(&adp3_vidmem.lock);
+   if (adp3_vidmem.valid[group] &&
+       now - adp3_vidmem.stamp_ns[group] < NPT_VIDMEM_CACHE_NS) {
+      *pVideoMemoryInfo = adp3_vidmem.info[group];
+      const HRESULT cached = adp3_vidmem.hr[group];
+      ReleaseSRWLockExclusive(&adp3_vidmem.lock);
+      return cached;
+   }
+   ReleaseSRWLockExclusive(&adp3_vidmem.lock);
+
+   const HRESULT hr = npt_idxgiadapter3_default_QueryVideoMemoryInfo(
+      self, NodeIndex, MemorySegmentGroup, pVideoMemoryInfo);
+
+   AcquireSRWLockExclusive(&adp3_vidmem.lock);
+   adp3_vidmem.hr[group] = hr;
+   adp3_vidmem.info[group] = *pVideoMemoryInfo;
+   adp3_vidmem.stamp_ns[group] = os_time_get_nano();
+   adp3_vidmem.valid[group] = NPT_SUCCEEDED(hr);
+   ReleaseSRWLockExclusive(&adp3_vidmem.lock);
+   return hr;
+}
+
 #define NPT_REGISTER_OVERRIDE_DXGI_ADAPTER4(m, f) \
    NPT_REGISTER_OVERRIDE(idxgiadapter4, m, f)
 #define NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(m, f) \
@@ -241,6 +294,8 @@ npt_overrides_dxgi_adapter_init(void)
    NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
       UnregisterVideoMemoryBudgetChangeNotification,
       adp3_UnregisterVideoMemoryBudgetChangeNotification_override);
+   NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
+      QueryVideoMemoryInfo, adp3_QueryVideoMemoryInfo_override);
 
    npt_com_register_family(adapter_tiers,
                            sizeof(struct npt_adapter_aux),
