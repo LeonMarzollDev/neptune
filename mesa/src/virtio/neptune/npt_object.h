@@ -10,6 +10,7 @@
 
 struct npt_device;
 struct npt_com_base;
+struct npt_privdata_entry;
 struct npt_ring;
 
 /*
@@ -64,6 +65,9 @@ struct npt_object {
     * ID3D12Object private data is answered from the guest's copy.  Set
     * only by npt_privdata_mark_sole. */
    bool privdata_sole;
+   /* That copy, under the device's privdata lock; freed with the wrapper
+    * (npt_privdata_free). */
+   struct npt_privdata_entry *privdata;
 };
 
 static inline void
@@ -83,6 +87,7 @@ npt_object_init(struct npt_object *obj, uint64_t host_id,
    obj->ring_ordered = false;
    obj->private_instance_ring = false;
    obj->privdata_sole = false;
+   obj->privdata = NULL;
    atomic_store_explicit(&obj->order_ring_id, 0, memory_order_relaxed);
 }
 

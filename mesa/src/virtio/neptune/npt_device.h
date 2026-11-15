@@ -102,8 +102,9 @@ struct npt_device {
 
    struct npt_wrapper_cache wrapper_cache;
 
-   /* ID3D12Object private data the guest answers (npt_privdata.h): here
-    * so every DLL sees every GUID set, as ids and wrappers are shared. */
+   /* The ID3D12Object private data GUIDs set through any id
+    * (npt_privdata.h): here so every DLL sees every GUID set, as ids and
+    * wrappers are shared. */
    struct npt_privdata privdata;
 
    /* Win32 event-HANDLE emulation; opaque, defined in npt_event.c. */

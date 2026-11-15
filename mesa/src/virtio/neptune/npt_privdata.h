@@ -19,8 +19,10 @@
  * a GUID written through any other id is answered by the host from then on,
  * for every object.
  *
- * The record lives in struct npt_device, which d3d11.dll, dxgi.dll and
- * d3d12.dll share: a GUID set through one DLL is known to the others.
+ * A copy lives on its wrapper (npt_object.privdata) and is freed with it.
+ * The GUIDs set and their host-only marks live in struct npt_device, which
+ * d3d11.dll, dxgi.dll and d3d12.dll share: a GUID set through one DLL is
+ * known to the others.
  */
 #ifndef NPT_PRIVDATA_H
 #define NPT_PRIVDATA_H
@@ -28,10 +30,7 @@
 #include "npt_common.h"
 #include "npt_cs.h"
 
-#define NPT_PRIVDATA_BUCKETS 1024u
 #define NPT_PRIVDATA_GUIDS 256u
-
-struct npt_privdata_entry;
 
 struct npt_privdata_guid {
    GUID guid;
@@ -42,22 +41,22 @@ struct npt_privdata_guid {
 
 /* Zero-initialized is empty. */
 struct npt_privdata {
+   /* Guards the GUID table and every wrapper's copy. */
    SRWLOCK lock;
-   struct npt_privdata_entry *buckets[NPT_PRIVDATA_BUCKETS];
    /* Every GUID written through any id.  A GUID missing here was never
     * set anywhere, so NOT_FOUND is certain without asking the host.
     * Once the table is full, lookups of a GUID missing from it go to the
     * host. */
    struct npt_privdata_guid guids[NPT_PRIVDATA_GUIDS];
    uint32_t guid_count;
-   bool guid_overflow;
 };
 
-/* Mark a wrapper as the only guest id of its host object, so its data is
- * answered from the guest's copy.  Only for a wrapper just made for a new
- * host object that no D3D12 method hands out again: a later id for the
- * same object (a QueryInterface the wrapper does not answer itself) is a
- * different wrapper without the mark. */
+/* Mark a wrapper as the sole guest id of its host object, so its data is
+ * answered from the guest's copy.  The guest relies on at most one marked
+ * id per host object: mark a wrapper just made for a new host object, and
+ * leave every later handout of it unmarked (a QueryInterface the wrapper
+ * does not answer itself).  A write through an unmarked id makes the GUID
+ * host-only. */
 void npt_privdata_mark_sole(void *self);
 
 /* Record SetPrivateData (data == NULL and size == 0 removes the entry),
@@ -71,10 +70,7 @@ void npt_privdata_set_name(void *self);
 bool npt_privdata_get(void *self, const GUID *guid, UINT *pDataSize,
                       void *pData, HRESULT *hr);
 
-/* Drop the entries of a wrapper being destroyed. */
-void npt_privdata_forget(void *self);
-
-/* Free what is left at device teardown. */
-void npt_privdata_fini(struct npt_privdata *pd);
+/* Free the copy of a wrapper being destroyed. */
+void npt_privdata_free(void *self);
 
 #endif

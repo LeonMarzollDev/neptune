@@ -409,7 +409,6 @@ npt_com_destroy(struct npt_com_base *com)
     * DC/SC ring unref (after ring's batch sees the COM_RELEASE),
     * aux_destroy, free, then drop device refs (the last release may
     * destroy dev). */
-   npt_privdata_forget(com);
    if (com->base.device)
       npt_device_wrapper_cache_remove(com->base.device, com->base.id);
    npt_com_send_release(com->base.device, com->base.id);
@@ -427,6 +426,7 @@ npt_com_destroy(struct npt_com_base *com)
       com->base.instance_ring = NULL;
       com->base.private_instance_ring = false;
    }
+   npt_privdata_free(com);
    if (com->aux_destroy)
       com->aux_destroy(com->aux);
    atomic_fetch_sub_explicit(&com->base.priv_ref, 1, memory_order_relaxed);

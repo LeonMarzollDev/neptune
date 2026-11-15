@@ -41,10 +41,21 @@
 #define FALSE ((BOOL)0)
 #endif
 
+/* A QueryVideoMemoryInfo answer kept until expires_ns (0: none). */
+struct adp3_vidmem_slot {
+   int64_t expires_ns;
+   HRESULT hr;
+   DXGI_QUERY_VIDEO_MEMORY_INFO info;
+};
+
 struct npt_adapter_aux {
    mtx_t lock;
    bool populated;
    struct npt_output_list outputs;
+   /* Node 0's local and non-local segment groups
+    * (adp3_QueryVideoMemoryInfo_override). */
+   SRWLOCK vidmem_lock;
+   struct adp3_vidmem_slot vidmem[2];
 };
 
 static void
@@ -63,6 +74,7 @@ adp_aux_init(struct npt_com_base *com, struct npt_device *dev, uint64_t host_id)
    (void)dev; (void)host_id;
    struct npt_adapter_aux *aux = com->aux;
    mtx_init(&aux->lock, mtx_plain);
+   InitializeSRWLock(&aux->vidmem_lock);
    com->aux_destroy = adp_aux_destroy;
 }
 
@@ -206,51 +218,57 @@ adp3_UnregisterVideoMemoryBudgetChangeNotification_override(void *self,
 /* QueryVideoMemoryInfo is a synchronous round trip to the render server, and
  * Unreal Engine 5 polls it thousands of times a second from its RHI threads
  * (about 2,400 calls a second in Bodycam's lobby, 170 us each: 40% of one
- * thread waiting).  The budget and usage it reports move slowly, so one answer
- * per segment group is kept for NPT_VIDMEM_CACHE_NS and served from the guest.
- * Node 0 only: a multi-adapter caller still asks the host. */
+ * thread waiting).  The budget and usage it reports move slowly, so the
+ * adapter keeps one answer per segment group for NPT_VIDMEM_CACHE_NS and
+ * serves it from the guest.  Node 0 only: a multi-adapter caller still asks
+ * the host. */
 #define NPT_VIDMEM_CACHE_NS (100ll * 1000 * 1000)
 
-struct adp3_vidmem_cache {
-   SRWLOCK lock;
-   bool valid[2];
-   int64_t stamp_ns[2];
-   HRESULT hr[2];
-   DXGI_QUERY_VIDEO_MEMORY_INFO info[2];
-};
-
-static struct adp3_vidmem_cache adp3_vidmem = { .lock = SRWLOCK_INIT };
+/* The slot kept for (NodeIndex, group), or NULL when the host answers. */
+static struct adp3_vidmem_slot *
+adp3_vidmem_slot(struct npt_adapter_aux *aux, UINT NodeIndex,
+                 DXGI_MEMORY_SEGMENT_GROUP group)
+{
+   if (!aux || NodeIndex != 0 || (unsigned)group >= ARRAY_SIZE(aux->vidmem))
+      return NULL;
+   return &aux->vidmem[group];
+}
 
 static HRESULT NPT_STDMETHODCALLTYPE
 adp3_QueryVideoMemoryInfo_override(
    void *self, UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
    DXGI_QUERY_VIDEO_MEMORY_INFO *pVideoMemoryInfo)
 {
-   const unsigned group = (unsigned)MemorySegmentGroup;
-   if (NodeIndex != 0 || group > 1 || !pVideoMemoryInfo)
+   struct npt_com_base *adp = self;
+   struct npt_adapter_aux *aux = adp->aux;
+   struct adp3_vidmem_slot *slot =
+      pVideoMemoryInfo ? adp3_vidmem_slot(aux, NodeIndex, MemorySegmentGroup)
+                       : NULL;
+   if (!slot)
       return npt_idxgiadapter3_default_QueryVideoMemoryInfo(
          self, NodeIndex, MemorySegmentGroup, pVideoMemoryInfo);
 
    const int64_t now = os_time_get_nano();
-   AcquireSRWLockExclusive(&adp3_vidmem.lock);
-   if (adp3_vidmem.valid[group] &&
-       now - adp3_vidmem.stamp_ns[group] < NPT_VIDMEM_CACHE_NS) {
-      *pVideoMemoryInfo = adp3_vidmem.info[group];
-      const HRESULT cached = adp3_vidmem.hr[group];
-      ReleaseSRWLockExclusive(&adp3_vidmem.lock);
-      return cached;
+   HRESULT hr = NPT_S_OK;
+   AcquireSRWLockShared(&aux->vidmem_lock);
+   const bool kept = now < slot->expires_ns;
+   if (kept) {
+      *pVideoMemoryInfo = slot->info;
+      hr = slot->hr;
    }
-   ReleaseSRWLockExclusive(&adp3_vidmem.lock);
+   ReleaseSRWLockShared(&aux->vidmem_lock);
+   if (kept)
+      return hr;
 
-   const HRESULT hr = npt_idxgiadapter3_default_QueryVideoMemoryInfo(
+   hr = npt_idxgiadapter3_default_QueryVideoMemoryInfo(
       self, NodeIndex, MemorySegmentGroup, pVideoMemoryInfo);
 
-   AcquireSRWLockExclusive(&adp3_vidmem.lock);
-   adp3_vidmem.hr[group] = hr;
-   adp3_vidmem.info[group] = *pVideoMemoryInfo;
-   adp3_vidmem.stamp_ns[group] = os_time_get_nano();
-   adp3_vidmem.valid[group] = NPT_SUCCEEDED(hr);
-   ReleaseSRWLockExclusive(&adp3_vidmem.lock);
+   AcquireSRWLockExclusive(&aux->vidmem_lock);
+   slot->hr = hr;
+   slot->info = *pVideoMemoryInfo;
+   slot->expires_ns =
+      NPT_SUCCEEDED(hr) ? os_time_get_nano() + NPT_VIDMEM_CACHE_NS : 0;
+   ReleaseSRWLockExclusive(&aux->vidmem_lock);
    return hr;
 }
 
@@ -262,11 +280,14 @@ adp3_SetVideoMemoryReservation_override(
 {
    const HRESULT hr = npt_idxgiadapter3_default_SetVideoMemoryReservation(
       self, NodeIndex, MemorySegmentGroup, Reservation);
-   const unsigned group = (unsigned)MemorySegmentGroup;
-   if (NodeIndex == 0 && group <= 1) {
-      AcquireSRWLockExclusive(&adp3_vidmem.lock);
-      adp3_vidmem.valid[group] = false;
-      ReleaseSRWLockExclusive(&adp3_vidmem.lock);
+   struct npt_com_base *adp = self;
+   struct npt_adapter_aux *aux = adp->aux;
+   struct adp3_vidmem_slot *slot =
+      adp3_vidmem_slot(aux, NodeIndex, MemorySegmentGroup);
+   if (slot) {
+      AcquireSRWLockExclusive(&aux->vidmem_lock);
+      slot->expires_ns = 0;
+      ReleaseSRWLockExclusive(&aux->vidmem_lock);
    }
    return hr;
 }

@@ -468,7 +468,6 @@ npt_device_destroy(struct npt_device *dev)
    mtx_destroy(&dev->instance_rings_mutex);
    mtx_destroy(&dev->tls_rings_mutex);
    npt_wrapper_cache_fini(&dev->wrapper_cache);
-   npt_privdata_fini(&dev->privdata);
    /* Released heaps leave their shmem destroys to the async reaper
     * (npt_resource.c), which writes to the transport: wait for them, or
     * the reaper writes to a closed socket and a freed renderer (about a
