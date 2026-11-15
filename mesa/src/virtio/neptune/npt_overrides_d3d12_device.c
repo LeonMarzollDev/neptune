@@ -45,7 +45,9 @@
  *  - EnqueueMakeResident: resident at once (MakeResident), then the fence
  *    is signalled from the CPU.  SetBackgroundProcessingMode has no
  *    background work to wait for: the event is set at once.
- *  - CreateCommandQueue1 pins its queue like CreateCommandQueue.
+ *  - CreateCommandQueue{,1} pin the queue to its ring and mark it the
+ *    sole id of its host object, whose private data the guest then
+ *    answers (npt_privdata.h).
  *  - The device and pipeline library version chains
  *    (npt_com_register_chain), up to ID3D12Device14 and
  *    ID3D12PipelineLibrary1.
@@ -772,9 +774,14 @@ dev12_CreateCommandQueue_override(void *self,
 {
    HRESULT hr = npt_id3d12device_default_CreateCommandQueue(
       self, pDesc, riid, ppCommandQueue);
-   if (NPT_SUCCEEDED(hr) && pDesc && ppCommandQueue && *ppCommandQueue)
+   if (NPT_SUCCEEDED(hr) && pDesc && ppCommandQueue && *ppCommandQueue) {
       npt_com_pin_queue_ring(*ppCommandQueue,
                              pDesc->Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
+      /* A new host queue, and no D3D12 method hands a queue out again:
+       * Unreal Engine's residency manager reads its fence from the
+       * queue's private data at every ExecuteCommandLists. */
+      npt_privdata_mark_sole(*ppCommandQueue);
+   }
    return hr;
 }
 
@@ -873,9 +880,11 @@ dev12_CreateCommandQueue1_override(void *self,
 {
    HRESULT hr = npt_id3d12device9_default_CreateCommandQueue1(
       self, pDesc, CreatorID, riid, ppCommandQueue);
-   if (NPT_SUCCEEDED(hr) && pDesc && ppCommandQueue && *ppCommandQueue)
+   if (NPT_SUCCEEDED(hr) && pDesc && ppCommandQueue && *ppCommandQueue) {
       npt_com_pin_queue_ring(*ppCommandQueue,
                              pDesc->Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
+      npt_privdata_mark_sole(*ppCommandQueue);
+   }
    return hr;
 }
 

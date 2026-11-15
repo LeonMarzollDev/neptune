@@ -409,7 +409,7 @@ npt_com_destroy(struct npt_com_base *com)
     * DC/SC ring unref (after ring's batch sees the COM_RELEASE),
     * aux_destroy, free, then drop device refs (the last release may
     * destroy dev). */
-   npt_privdata_forget(com->base.id);
+   npt_privdata_forget(com);
    if (com->base.device)
       npt_device_wrapper_cache_remove(com->base.device, com->base.id);
    npt_com_send_release(com->base.device, com->base.id);

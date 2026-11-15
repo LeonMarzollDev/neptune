@@ -60,6 +60,10 @@ struct npt_object {
     * ring): npt_com_destroy destroys it instead of unrefing the shared
     * ring.  Set only by npt_com_pin_queue_ring. */
    bool private_instance_ring;
+   /* No other guest id names this object's host object, so its
+    * ID3D12Object private data is answered from the guest's copy.  Set
+    * only by npt_privdata_mark_sole. */
+   bool privdata_sole;
 };
 
 static inline void
@@ -78,6 +82,7 @@ npt_object_init(struct npt_object *obj, uint64_t host_id,
    atomic_store_explicit(&obj->device_ref_holds, 0, memory_order_relaxed);
    obj->ring_ordered = false;
    obj->private_instance_ring = false;
+   obj->privdata_sole = false;
    atomic_store_explicit(&obj->order_ring_id, 0, memory_order_relaxed);
 }
 

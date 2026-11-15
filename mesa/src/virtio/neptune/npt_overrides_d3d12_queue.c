@@ -98,45 +98,50 @@ queue12_Signal_override(void *self, ID3D12Fence *pFence, UINT64 Value)
 }
 
 /* The timestamp frequency of a queue never changes, and engines read it
- * every frame for their GPU timers: one round trip per queue is enough. */
-#define QUEUE12_FREQ_SLOTS 16u
-struct queue12_freq_entry {
-   _Atomic uint64_t object_id;
-   _Atomic uint64_t frequency;
+ * every frame for their GPU timers: one round trip per queue is enough.
+ * The answer is kept in the queue wrapper's aux, freed with it. */
+struct npt_d3d12_queue_aux {
+   _Atomic uint64_t timestamp_frequency; /* 0 = not asked yet */
 };
-static struct queue12_freq_entry queue12_freq_cache[QUEUE12_FREQ_SLOTS];
+
+static void
+npt_d3d12_queue_aux_destroy(void *aux)
+{
+   free(aux);
+}
+
+static void
+npt_d3d12_queue_aux_init(struct npt_com_base *com, struct npt_device *dev,
+                         uint64_t host_id)
+{
+   com->aux_destroy = npt_d3d12_queue_aux_destroy;
+   (void)dev; (void)host_id;
+}
 
 static HRESULT NPT_STDMETHODCALLTYPE
 queue12_GetTimestampFrequency_override(void *self, UINT64 *pFrequency)
 {
-   if (!pFrequency)
-      return npt_id3d12commandqueue_default_GetTimestampFrequency(self, pFrequency);
-
-   const uint64_t id = npt_com_self_id(self);
-   for (unsigned i = 0; i < QUEUE12_FREQ_SLOTS; i++) {
-      if (atomic_load(&queue12_freq_cache[i].object_id) == id) {
-         const uint64_t f = atomic_load(&queue12_freq_cache[i].frequency);
-         if (f) {
-            *pFrequency = f;
-            return NPT_S_OK;
-         }
+   struct npt_d3d12_queue_aux *aux =
+      pFrequency ? npt_com_family_aux(self, npt_d3d12_queue_aux_destroy)
+                 : NULL;
+   if (aux) {
+      const uint64_t f = atomic_load(&aux->timestamp_frequency);
+      if (f) {
+         *pFrequency = f;
+         return NPT_S_OK;
       }
    }
 
    const HRESULT hr =
       npt_id3d12commandqueue_default_GetTimestampFrequency(self, pFrequency);
-   if (NPT_SUCCEEDED(hr) && *pFrequency) {
-      for (unsigned i = 0; i < QUEUE12_FREQ_SLOTS; i++) {
-         uint64_t empty = 0;
-         if (atomic_compare_exchange_strong(&queue12_freq_cache[i].object_id,
-                                            &empty, id)) {
-            atomic_store(&queue12_freq_cache[i].frequency, *pFrequency);
-            break;
-         }
-      }
-   }
+   if (aux && NPT_SUCCEEDED(hr))
+      atomic_store(&aux->timestamp_frequency, *pFrequency);
    return hr;
 }
+
+static const GUID *const queue12_tiers[] = {
+   &NPT_IID_ID3D12CommandQueue, NULL,
+};
 
 void
 npt_overrides_d3d12_queue_init(void)
@@ -147,4 +152,6 @@ npt_overrides_d3d12_queue_init(void)
                          queue12_ExecuteCommandLists_override);
    NPT_REGISTER_OVERRIDE(id3d12commandqueue, Signal,
                          queue12_Signal_override);
+   npt_com_register_family(queue12_tiers, sizeof(struct npt_d3d12_queue_aux),
+                           npt_d3d12_queue_aux_init);
 }

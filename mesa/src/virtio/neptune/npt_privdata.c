@@ -3,30 +3,18 @@
  */
 #include "npt_privdata.h"
 
+#include "npt_com.h"
+
 #include <stdlib.h>
 #include <string.h>
-
-#define NPT_PRIVDATA_BUCKETS 1024u
-#define NPT_PRIVDATA_GUIDS 256u
 
 struct npt_privdata_entry {
    struct npt_privdata_entry *next;
    uint64_t object_id;
    GUID guid;
-   bool opaque;
    UINT size;
    uint8_t data[];
 };
-
-static SRWLOCK npt_privdata_lock = SRWLOCK_INIT;
-static struct npt_privdata_entry *npt_privdata_buckets[NPT_PRIVDATA_BUCKETS];
-
-/* Every GUID any object was ever given data for.  A GUID missing here was
- * never set anywhere, so NOT_FOUND is certain without asking the host.  When
- * the table is full, lookups of unknown GUIDs go to the host. */
-static GUID npt_privdata_seen[NPT_PRIVDATA_GUIDS];
-static uint32_t npt_privdata_seen_count;
-static bool npt_privdata_seen_overflow;
 
 /* WKPDID_D3DDebugObjectName and WKPDID_D3DDebugObjectNameW: SetName stores
  * them on the host. */
@@ -44,33 +32,45 @@ npt_privdata_bucket(uint64_t object_id)
    return (uint32_t)object_id & (NPT_PRIVDATA_BUCKETS - 1);
 }
 
-static bool
-npt_privdata_guid_seen_locked(const GUID *guid)
+static struct npt_privdata *
+npt_privdata_of(struct npt_com_base *com)
 {
-   for (uint32_t i = 0; i < npt_privdata_seen_count; i++) {
-      if (!memcmp(&npt_privdata_seen[i], guid, sizeof(*guid)))
-         return true;
-   }
-   return false;
+   return com->base.device ? &com->base.device->privdata : NULL;
 }
 
-static void
-npt_privdata_note_guid_locked(const GUID *guid)
+static struct npt_privdata_guid *
+npt_privdata_find_guid_locked(struct npt_privdata *pd, const GUID *guid)
 {
-   if (npt_privdata_guid_seen_locked(guid))
-      return;
-   if (npt_privdata_seen_count == NPT_PRIVDATA_GUIDS) {
-      npt_privdata_seen_overflow = true;
-      return;
+   for (uint32_t i = 0; i < pd->guid_count; i++) {
+      if (!memcmp(&pd->guids[i].guid, guid, sizeof(*guid)))
+         return &pd->guids[i];
    }
-   npt_privdata_seen[npt_privdata_seen_count++] = *guid;
+   return NULL;
+}
+
+/* NULL once the table is full: the host answers that GUID. */
+static struct npt_privdata_guid *
+npt_privdata_note_guid_locked(struct npt_privdata *pd, const GUID *guid)
+{
+   struct npt_privdata_guid *g = npt_privdata_find_guid_locked(pd, guid);
+   if (g)
+      return g;
+   if (pd->guid_count == NPT_PRIVDATA_GUIDS) {
+      pd->guid_overflow = true;
+      return NULL;
+   }
+   g = &pd->guids[pd->guid_count++];
+   g->guid = *guid;
+   g->host_only = false;
+   return g;
 }
 
 static struct npt_privdata_entry **
-npt_privdata_find_locked(uint64_t object_id, const GUID *guid)
+npt_privdata_find_locked(struct npt_privdata *pd, uint64_t object_id,
+                         const GUID *guid)
 {
    struct npt_privdata_entry **link =
-      &npt_privdata_buckets[npt_privdata_bucket(object_id)];
+      &pd->buckets[npt_privdata_bucket(object_id)];
    for (; *link; link = &(*link)->next) {
       if ((*link)->object_id == object_id &&
           !memcmp(&(*link)->guid, guid, sizeof(*guid)))
@@ -79,121 +79,165 @@ npt_privdata_find_locked(uint64_t object_id, const GUID *guid)
    return NULL;
 }
 
+/* A write through `com`: `entry` replaces its copy (NULL removes it), or,
+ * with `host_only`, the host alone knows the GUID from now on. */
 static void
-npt_privdata_store(uint64_t object_id, const GUID *guid, bool opaque,
-                   UINT size, const void *data)
+npt_privdata_write(struct npt_com_base *com, const GUID *guid,
+                   struct npt_privdata_entry *entry, bool host_only)
 {
+   struct npt_privdata *pd = npt_privdata_of(com);
+   if (!pd) {
+      free(entry);
+      return;
+   }
+
+   struct npt_privdata_entry *old = NULL;
+   AcquireSRWLockExclusive(&pd->lock);
+   struct npt_privdata_guid *g = npt_privdata_note_guid_locked(pd, guid);
+   if (com->base.privdata_sole) {
+      struct npt_privdata_entry **link =
+         npt_privdata_find_locked(pd, com->base.id, guid);
+      if (link) {
+         old = *link;
+         *link = old->next;
+      }
+   }
+   if (g && host_only) {
+      g->host_only = true;
+   } else if (g && entry && !g->host_only) {
+      struct npt_privdata_entry **head =
+         &pd->buckets[npt_privdata_bucket(com->base.id)];
+      entry->next = *head;
+      *head = entry;
+      entry = NULL;
+   }
+   ReleaseSRWLockExclusive(&pd->lock);
+   free(old);
+   free(entry);
+}
+
+void
+npt_privdata_mark_sole(void *self)
+{
+   ((struct npt_com_base *)self)->base.privdata_sole = true;
+}
+
+void
+npt_privdata_set(void *self, const GUID *guid, UINT size, const void *data)
+{
+   struct npt_com_base *com = self;
    if (!guid)
       return;
 
+   /* Another id of this object may hold the GUID too: only the host
+    * sees both. */
+   bool host_only = !com->base.privdata_sole;
    struct npt_privdata_entry *entry = NULL;
-   const bool remove = !opaque && (!data || !size);
-   if (!remove) {
-      entry = malloc(sizeof(*entry) + (opaque ? 0 : size));
+   if (!host_only && (data || size)) {
+      /* A size without data, or data without a size, is the host's to
+       * judge. */
+      if (data && size)
+         entry = malloc(sizeof(*entry) + size);
       if (entry) {
-         entry->object_id = object_id;
+         entry->object_id = com->base.id;
          entry->guid = *guid;
-         entry->opaque = opaque;
-         entry->size = opaque ? 0 : size;
-         if (!opaque)
-            memcpy(entry->data, data, size);
+         entry->size = size;
+         memcpy(entry->data, data, size);
       } else {
-         /* No copy: the host still has the data, so make lookups ask it. */
-         opaque = true;
+         host_only = true;
       }
    }
-
-   AcquireSRWLockExclusive(&npt_privdata_lock);
-   npt_privdata_note_guid_locked(guid);
-   struct npt_privdata_entry **link = npt_privdata_find_locked(object_id, guid);
-   if (link) {
-      struct npt_privdata_entry *old = *link;
-      *link = old->next;
-      free(old);
-   }
-   if (entry) {
-      struct npt_privdata_entry **head =
-         &npt_privdata_buckets[npt_privdata_bucket(object_id)];
-      entry->next = *head;
-      *head = entry;
-   } else if (!remove) {
-      /* Allocation failed: forget the GUID is answerable locally. */
-      npt_privdata_seen_overflow = true;
-   }
-   ReleaseSRWLockExclusive(&npt_privdata_lock);
+   npt_privdata_write(com, guid, entry, host_only);
 }
 
 void
-npt_privdata_set(uint64_t object_id, const GUID *guid, UINT size,
-                 const void *data)
+npt_privdata_set_interface(void *self, const GUID *guid)
 {
-   npt_privdata_store(object_id, guid, false, size, data);
+   if (guid)
+      npt_privdata_write(self, guid, NULL, true);
 }
 
 void
-npt_privdata_set_opaque(uint64_t object_id, const GUID *guid)
+npt_privdata_set_name(void *self)
 {
-   npt_privdata_store(object_id, guid, true, 0, NULL);
-}
-
-void
-npt_privdata_note_name(uint64_t object_id)
-{
-   npt_privdata_store(object_id, &npt_privdata_name_a, true, 0, NULL);
-   npt_privdata_store(object_id, &npt_privdata_name_w, true, 0, NULL);
+   npt_privdata_write(self, &npt_privdata_name_a, NULL, true);
+   npt_privdata_write(self, &npt_privdata_name_w, NULL, true);
 }
 
 bool
-npt_privdata_get(uint64_t object_id, const GUID *guid, UINT *pDataSize,
+npt_privdata_get(void *self, const GUID *guid, UINT *pDataSize,
                  void *pData, HRESULT *hr)
 {
-   if (!guid || !pDataSize)
+   struct npt_com_base *com = self;
+   struct npt_privdata *pd = npt_privdata_of(com);
+   if (!pd || !guid || !pDataSize)
       return false;
 
    bool answered = false;
-   AcquireSRWLockShared(&npt_privdata_lock);
-   struct npt_privdata_entry **link = npt_privdata_find_locked(object_id, guid);
-   if (link) {
-      const struct npt_privdata_entry *entry = *link;
-      if (!entry->opaque) {
-         if (!pData) {
-            *pDataSize = entry->size;
-            *hr = NPT_S_OK;
-         } else if (*pDataSize < entry->size) {
-            *pDataSize = entry->size;
-            *hr = NPT_DXGI_ERROR_MORE_DATA;
-         } else {
-            memcpy(pData, entry->data, entry->size);
-            *pDataSize = entry->size;
-            *hr = NPT_S_OK;
-         }
-         answered = true;
-      }
-   } else if (!npt_privdata_seen_overflow &&
-              !npt_privdata_guid_seen_locked(guid)) {
+   const struct npt_privdata_entry *entry = NULL;
+   AcquireSRWLockShared(&pd->lock);
+   const struct npt_privdata_guid *g = npt_privdata_find_guid_locked(pd, guid);
+   if (!g) {
       /* Never set on any object: the host cannot have it either. */
-      *pDataSize = 0;
-      *hr = NPT_DXGI_ERROR_NOT_FOUND;
+      answered = !pd->guid_overflow;
+   } else if (com->base.privdata_sole && !g->host_only) {
+      /* No other id of this object wrote the GUID, or it would be
+       * host-only: no copy here means nothing set. */
+      struct npt_privdata_entry **link =
+         npt_privdata_find_locked(pd, com->base.id, guid);
+      entry = link ? *link : NULL;
       answered = true;
    }
-   ReleaseSRWLockShared(&npt_privdata_lock);
+   if (answered && !entry) {
+      *pDataSize = 0;
+      *hr = NPT_DXGI_ERROR_NOT_FOUND;
+   } else if (entry) {
+      if (!pData) {
+         *hr = NPT_S_OK;
+      } else if (*pDataSize < entry->size) {
+         *hr = NPT_DXGI_ERROR_MORE_DATA;
+      } else {
+         memcpy(pData, entry->data, entry->size);
+         *hr = NPT_S_OK;
+      }
+      *pDataSize = entry->size;
+   }
+   ReleaseSRWLockShared(&pd->lock);
    return answered;
 }
 
 void
-npt_privdata_forget(uint64_t object_id)
+npt_privdata_forget(void *self)
 {
-   AcquireSRWLockExclusive(&npt_privdata_lock);
+   struct npt_com_base *com = self;
+   struct npt_privdata *pd = npt_privdata_of(com);
+   if (!pd || !com->base.privdata_sole)
+      return;
+
+   AcquireSRWLockExclusive(&pd->lock);
    struct npt_privdata_entry **link =
-      &npt_privdata_buckets[npt_privdata_bucket(object_id)];
+      &pd->buckets[npt_privdata_bucket(com->base.id)];
    while (*link) {
       struct npt_privdata_entry *entry = *link;
-      if (entry->object_id == object_id) {
+      if (entry->object_id == com->base.id) {
          *link = entry->next;
          free(entry);
       } else {
          link = &entry->next;
       }
    }
-   ReleaseSRWLockExclusive(&npt_privdata_lock);
+   ReleaseSRWLockExclusive(&pd->lock);
+}
+
+void
+npt_privdata_fini(struct npt_privdata *pd)
+{
+   /* The device-destroy drain forgot every wrapper; free defensively. */
+   for (uint32_t i = 0; i < NPT_PRIVDATA_BUCKETS; i++) {
+      while (pd->buckets[i]) {
+         struct npt_privdata_entry *entry = pd->buckets[i];
+         pd->buckets[i] = entry->next;
+         free(entry);
+      }
+   }
 }

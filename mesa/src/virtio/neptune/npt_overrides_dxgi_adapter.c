@@ -254,6 +254,23 @@ adp3_QueryVideoMemoryInfo_override(
    return hr;
 }
 
+/* A reservation changes the CurrentReservation the next query reports. */
+static HRESULT NPT_STDMETHODCALLTYPE
+adp3_SetVideoMemoryReservation_override(
+   void *self, UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
+   UINT64 Reservation)
+{
+   const HRESULT hr = npt_idxgiadapter3_default_SetVideoMemoryReservation(
+      self, NodeIndex, MemorySegmentGroup, Reservation);
+   const unsigned group = (unsigned)MemorySegmentGroup;
+   if (NodeIndex == 0 && group <= 1) {
+      AcquireSRWLockExclusive(&adp3_vidmem.lock);
+      adp3_vidmem.valid[group] = false;
+      ReleaseSRWLockExclusive(&adp3_vidmem.lock);
+   }
+   return hr;
+}
+
 #define NPT_REGISTER_OVERRIDE_DXGI_ADAPTER4(m, f) \
    NPT_REGISTER_OVERRIDE(idxgiadapter4, m, f)
 #define NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(m, f) \
@@ -296,6 +313,8 @@ npt_overrides_dxgi_adapter_init(void)
       adp3_UnregisterVideoMemoryBudgetChangeNotification_override);
    NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
       QueryVideoMemoryInfo, adp3_QueryVideoMemoryInfo_override);
+   NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
+      SetVideoMemoryReservation, adp3_SetVideoMemoryReservation_override);
 
    npt_com_register_family(adapter_tiers,
                            sizeof(struct npt_adapter_aux),
